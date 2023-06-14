@@ -442,7 +442,7 @@ static void rcuhashbash_print_stats(void)
 	       "rcuhashbash summary: reads: %llu primary hits, %llu slowpath primary hits, %llu secondary hits, %llu misses\n"
 	       "rcuhashbash summary: resizes: %llu\n"
 	       "rcuhashbash summary: %s\n"
-		   "rcuhashbash summary: totak time: %llu ns\n",
+		   "rcuhashbash summary: total time: %llu ns\n",
 	       test, readers, resize ? "true" : "false",
 	       entries, shift1, 1UL << shift1, shift2, 1UL << shift2,
 	       s.read_hits, s.read_hits_slowpath, s.read_hits_fallback, s.read_misses,
