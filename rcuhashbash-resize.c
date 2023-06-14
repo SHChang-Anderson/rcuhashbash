@@ -110,7 +110,7 @@ rcu_random(struct rcu_random_state *rrsp)
 static bool rcuhashbash_try_lookup(struct rcuhashbash_table *t, u32 value)
 {
 	struct rcuhashbash_entry *entry;
-	struct hlist_node *node;
+	struct hlist_node *node __attribute__((unused));
 
 	hlist_for_each_entry_rcu(entry, &t->buckets[value & t->mask], node)
 		if (entry->value == value)
@@ -180,7 +180,7 @@ static int rcuhashbash_resize(u8 new_buckets_shift, struct stats *stats)
 		temp_table->mask = mask2;
 		for (i = 0; i <= mask2; i++) {
 			struct rcuhashbash_entry *entry;
-			struct hlist_node *node;
+			struct hlist_node *node __attribute__((unused));
 			hlist_for_each_entry(entry, &table->buckets[i & table->mask], node)
 				if ((entry->value & mask2) == i) {
 					temp_table->buckets[i].first = &entry->node;
@@ -198,7 +198,7 @@ static int rcuhashbash_resize(u8 new_buckets_shift, struct stats *stats)
 			moved_one = false;
 			for (i = 0; i <= old_table->mask; i ++) {
 				struct rcuhashbash_entry *entry_prev, *entry;
-				struct hlist_node *node;
+				struct hlist_node *node __attribute__((unused));
 				if (hlist_empty(&old_table->buckets[i]))
 					continue;
 				entry_prev = hlist_entry(old_table->buckets[i].first, struct rcuhashbash_entry, node);
