@@ -2,7 +2,7 @@
 
 CPPCHECK_suppresses="--suppress=unmatchedSuppression \
 --suppress=missingIncludeSystem -i ksort.mod.c --suppress=variableScope \
---suppress=uninitvar:rcuhashbash-resize.c:208"
+--suppress=uninitvar:rcuhashbash-resize.c:229" \
 
 CPPCHECK_OPTS="-I. --enable=all --error-exitcode=1 --force $CPPCHECK_suppresses ."
 

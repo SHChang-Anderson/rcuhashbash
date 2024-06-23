@@ -9,6 +9,7 @@
 #include <linux/kthread.h>
 #include <linux/list.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/random.h>
 #include <linux/rcupdate.h>
 #include <linux/sched/clock.h>
@@ -21,7 +22,9 @@ MODULE_LICENSE("GPL");
 
 static char *test = "rcu"; /* Hash table implementation to benchmark */
 static int readers = -1;
-static bool resize = true;
+static bool insert = false;
+static int insertct = 0;
+static bool resize = false;
 static u8 shift1 = 13;
 static u8 shift2 = 14;
 static unsigned long entries = 65536;
@@ -51,12 +54,14 @@ struct stats {
     u64 read_hits_slowpath; /* Slowpath primary table hits (if applicable) */
     u64 read_misses;
     u64 resizes;
+    u64 insertions;
 };
 
 struct rcuhashbash_ops {
     const char *test;
     int (*read)(u32 value, struct stats *stats);
     int (*resize)(u8 new_buckets_shift, struct stats *stats);
+    int (*insert)(u32 value, struct stats *stats);
 };
 
 static struct rcuhashbash_ops *ops;
@@ -92,6 +97,8 @@ struct rcu_random_state {
 
 s64 start, end;
 
+DEFINE_MUTEX(table_mutex);
+
 /*
  * Crude but fast random-number generator.  Uses a linear congruential
  * generator, with occasional help from cpu_clock().
@@ -104,6 +111,20 @@ static unsigned long rcu_random(struct rcu_random_state *rrsp)
     }
     rrsp->rrs_state = rrsp->rrs_state * RCU_RANDOM_MULT + RCU_RANDOM_ADD;
     return swahw32(rrsp->rrs_state);
+}
+
+static int rhashtable_insert(u32 value, struct stats *stats)
+{
+    struct rcuhashbash_entry *entry;
+    entry = kmem_cache_zalloc(entry_cache, GFP_KERNEL);
+
+    if (!entry)
+        return -ENOMEM;
+
+    entry->value = value;
+    hlist_add_head_rcu(&entry->node, &table->buckets[value & table->mask]);
+    stats->insertions++;
+    return 0;
 }
 
 static bool rcuhashbash_try_lookup(struct rcuhashbash_table *t, u32 value)
@@ -406,9 +427,35 @@ static int rcuhashbash_resize_thread(void *arg)
 
     do {
         cond_resched();
+        mutex_lock(&table_mutex);
         err = ops->resize(table->mask == (1UL << shift1) - 1 ? shift2 : shift1,
                           &stats);
+        mutex_unlock(&table_mutex);
     } while (!kthread_should_stop() && !err);
+
+    *stats_ret = stats;
+
+    while (!kthread_should_stop())
+        schedule_timeout_interruptible(1);
+    return err;
+}
+
+static int rcuhashbash_insert_thread(void *arg)
+{
+    int i = 0;
+    int err;
+    struct stats *stats_ret = arg;
+    struct stats stats = {};
+
+    set_user_nice(current, 19);
+
+    do {
+        cond_resched();
+        mutex_lock(&table_mutex);
+        err = ops->insert((entries + i), &stats);
+        mutex_unlock(&table_mutex);
+        i++;
+    } while (!kthread_should_stop() && !err && i < insertct);
 
     *stats_ret = stats;
 
@@ -422,6 +469,7 @@ static struct rcuhashbash_ops all_ops[] = {
         .test = "rcu",
         .read = rcuhashbash_read_rcu,
         .resize = rcuhashbash_resize,
+        .insert = rhashtable_insert,
     },
     {
         .test = "ddds",
@@ -447,26 +495,30 @@ static void rcuhashbash_print_stats(void)
         return;
     }
 
-    for (i = 0; i < readers + resize; i++) {
+    for (i = 0; i < readers + resize + insert; i++) {
         s.read_hits += thread_stats[i].read_hits;
         s.read_hits_slowpath += thread_stats[i].read_hits_slowpath;
         s.read_hits_fallback += thread_stats[i].read_hits_fallback;
         s.read_misses += thread_stats[i].read_misses;
         s.resizes += thread_stats[i].resizes;
+        s.insertions += thread_stats[i].insertions;
     }
 
     printk(KERN_ALERT
            "rcuhashbash summary: test=%s readers=%d resize=%s\n"
+           "rcuhashbash summary: insert=%s insert counts=%d\n"
            "rcuhashbash summary: entries=%lu shift1=%u (%lu buckets) shift2=%u "
            "(%lu buckets)\n"
            "rcuhashbash summary: reads: %llu primary hits, %llu slowpath "
            "primary hits, %llu secondary hits, %llu misses\n"
            "rcuhashbash summary: resizes: %llu\n"
+           "rcuhashbash summary: inserts: %llu\n"
            "rcuhashbash summary: %s\n"
            "rcuhashbash summary: total time: %llu ns\n",
-           test, readers, resize ? "true" : "false", entries, shift1,
-           1UL << shift1, shift2, 1UL << shift2, s.read_hits,
-           s.read_hits_slowpath, s.read_hits_fallback, s.read_misses, s.resizes,
+           test, readers, resize ? "true" : "false", insert ? "true" : "false",
+           insert ? insertct : 0, entries, shift1, 1UL << shift1, shift2,
+           1UL << shift2, s.read_hits, s.read_hits_slowpath,
+           s.read_hits_fallback, s.read_misses, s.resizes, s.insertions,
            s.read_misses == 0 ? "PASS" : "FAIL", end - start);
 }
 
@@ -475,7 +527,7 @@ static void rcuhashbash_exit(void)
     unsigned long i;
     int ret;
     if (tasks) {
-        for (i = 0; i < readers + resize; i++)
+        for (i = 0; i < readers + resize + insert; i++)
             if (tasks[i]) {
                 ret = kthread_stop(tasks[i]);
                 if (ret)
@@ -570,24 +622,27 @@ static __init int rcuhashbash_init(void)
     }
 
     thread_stats =
-        kcalloc(readers + resize, sizeof(thread_stats[0]), GFP_KERNEL);
+        kcalloc(readers + resize + insert, sizeof(thread_stats[0]), GFP_KERNEL);
     if (!thread_stats)
         goto enomem;
 
-    tasks = kcalloc(readers + resize, sizeof(tasks[0]), GFP_KERNEL);
+    tasks = kcalloc(readers + resize + insert, sizeof(tasks[0]), GFP_KERNEL);
     if (!tasks)
         goto enomem;
 
     printk(KERN_ALERT "rcuhashbash starting threads\n");
     start = ktime_get_ns();
-    for (i = 0; i < readers + resize; i++) {
+    for (i = 0; i < readers + resize + insert; i++) {
         struct task_struct *task;
         if (i < readers)
             task = kthread_run(rcuhashbash_read_thread, &thread_stats[i],
                                "rcuhashbash_read");
-        else
+        else if (i < readers + resize)
             task = kthread_run(rcuhashbash_resize_thread, &thread_stats[i],
                                "rcuhashbash_resize");
+        else
+            task = kthread_run(rcuhashbash_insert_thread, &thread_stats[i],
+                               "rcuhashbash_insert");
         if (IS_ERR(task)) {
             ret = PTR_ERR(task);
             goto error;
