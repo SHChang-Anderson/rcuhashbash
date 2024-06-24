@@ -160,6 +160,19 @@ static struct hlist_node **hlist_advance_last_next(
     return old_last_next;
 }
 
+static bool rcuhashbash_verify_insert(u32 value)
+{
+    bool found = false;
+
+    rcu_read_lock();
+    if (rcuhashbash_try_lookup(rcu_dereference(table), value)) {
+        found = true;
+    }
+    rcu_read_unlock();
+
+    return found;
+}
+
 static int rcuhashbash_resize(u8 new_buckets_shift, struct stats *stats)
 {
     unsigned long len2 = 1UL << new_buckets_shift;
@@ -454,6 +467,8 @@ static int rcuhashbash_insert_thread(void *arg)
         mutex_lock(&table_mutex);
         err = ops->insert((entries + i), &stats);
         mutex_unlock(&table_mutex);
+        if (!rcuhashbash_verify_insert(entries + i))
+            printk(KERN_ALERT "insert failure\n");
         i++;
     } while (!kthread_should_stop() && !err && i < insertct);
 
