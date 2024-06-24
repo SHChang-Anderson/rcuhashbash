@@ -1,6 +1,8 @@
 *.ko
 *.mod.c
 *.o
+*.txt
+*.png
 .*.cmd
 .tmp_versions
 /Module.symvers
