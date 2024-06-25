@@ -1,1 +1,1 @@
-/home/shchang/rhashtablet/reclone/rcuhashbash/rcuhashbash-resize.o
+/home/qqwe/rcuhashbash/rcuhashbash-resize.o

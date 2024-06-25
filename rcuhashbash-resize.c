@@ -14,6 +14,7 @@
 #include <linux/rcupdate.h>
 #include <linux/sched/clock.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
 
 MODULE_AUTHOR("Josh Triplett <josh@kernel.org>");
@@ -45,6 +46,7 @@ MODULE_PARM_DESC(entries, "Number of hash table entries");
 
 struct rcuhashbash_table {
     unsigned long mask;
+    spinlock_t *locks;
     struct hlist_head buckets[];
 };
 
@@ -68,6 +70,7 @@ static struct rcuhashbash_ops *ops;
 
 static struct rcuhashbash_table *table;
 static struct rcuhashbash_table *table2;
+static struct rcuhashbash_table *future_tbl;
 
 static seqcount_t seqcount;
 static DEFINE_RWLOCK(rwlock);
@@ -77,6 +80,13 @@ struct rcuhashbash_entry {
     struct rcu_head rcu_head;
     u32 value;
 };
+
+
+static spinlock_t *bucket_lock(const struct rcuhashbash_table *tbl, u32 hash)
+{
+    return &tbl->locks[hash];
+}
+
 
 static struct kmem_cache *entry_cache;
 
@@ -97,12 +107,21 @@ struct rcu_random_state {
 
 s64 start, end;
 
-DEFINE_MUTEX(table_mutex);
 
-/*
- * Crude but fast random-number generator.  Uses a linear congruential
- * generator, with occasional help from cpu_clock().
- */
+static int alloc_bucket_locks(struct rcuhashbash_table *t, int tsize)
+{
+    int i;
+    t->locks = kmalloc_array(tsize, sizeof(spinlock_t), GFP_KERNEL);
+    if (!t->locks)
+        return -ENOMEM;
+    for (i = 0; i < tsize; i++) {
+        spin_lock_init(&t->locks[i]);
+    }
+
+
+    return 0;
+}
+
 static unsigned long rcu_random(struct rcu_random_state *rrsp)
 {
     if (--rrsp->rrs_count < 0) {
@@ -116,14 +135,20 @@ static unsigned long rcu_random(struct rcu_random_state *rrsp)
 static int rhashtable_insert(u32 value, struct stats *stats)
 {
     struct rcuhashbash_entry *entry;
+    spinlock_t *new_bucket_lock;
     entry = kmem_cache_zalloc(entry_cache, GFP_KERNEL);
 
     if (!entry)
         return -ENOMEM;
-
+    rcu_read_lock();
     entry->value = value;
-    hlist_add_head_rcu(&entry->node, &table->buckets[value & table->mask]);
+    new_bucket_lock = bucket_lock(future_tbl, (value & future_tbl->mask));
+    spin_lock(new_bucket_lock);
+    hlist_add_head_rcu(&entry->node,
+                       &future_tbl->buckets[value & future_tbl->mask]);
+    spin_unlock(new_bucket_lock);
     stats->insertions++;
+    rcu_read_unlock();
     return 0;
 }
 
@@ -132,43 +157,56 @@ static bool rcuhashbash_try_lookup(struct rcuhashbash_table *t, u32 value)
     struct rcuhashbash_entry *entry;
     struct hlist_node *node __attribute__((unused));
 
+
     hlist_for_each_entry_rcu(entry, &t->buckets[value & t->mask],
                              node) if (entry->value == value) return true;
+    return false;
+}
+
+static bool rcuhashbash_try_lookup2(struct rcuhashbash_table *t,
+                                    struct rcuhashbash_table *newt,
+                                    u32 value)
+{
+    struct rcuhashbash_entry *entry;
+    struct hlist_node *node __attribute__((unused));
+restart:
+    hlist_for_each_entry_rcu(entry, &newt->buckets[value & newt->mask],
+                             node) if (entry->value == value) return true;
+
+
+    if (unlikely(newt != t)) {
+        newt = t;
+        goto restart;
+    }
     return false;
 }
 
 static int rcuhashbash_read_rcu(u32 value, struct stats *stats)
 {
     rcu_read_lock();
-    if (rcuhashbash_try_lookup(rcu_dereference(table), value))
+    if (rcuhashbash_try_lookup2(rcu_dereference(table),
+                                rcu_dereference(future_tbl), value))
         stats->read_hits++;
     else
         stats->read_misses++;
     rcu_read_unlock();
 
+
     return 0;
-}
-
-static struct hlist_node **hlist_advance_last_next(
-    struct hlist_node **old_last_next)
-{
-    struct hlist_head h = {.first = *old_last_next};
-    struct hlist_node *node;
-
-    hlist_for_each(node, &h) if (!node->next) return &node->next;
-    /* If we get here, we had an empty list. */
-    return old_last_next;
 }
 
 static bool rcuhashbash_verify_insert(u32 value)
 {
     bool found = false;
 
+
     rcu_read_lock();
-    if (rcuhashbash_try_lookup(rcu_dereference(table), value)) {
+    if (rcuhashbash_try_lookup2(rcu_dereference(table),
+                                rcu_dereference(future_tbl), value)) {
         found = true;
     }
     rcu_read_unlock();
+
 
     return found;
 }
@@ -178,50 +216,74 @@ static int rcuhashbash_resize(u8 new_buckets_shift, struct stats *stats)
     unsigned long len2 = 1UL << new_buckets_shift;
     unsigned long mask2 = len2 - 1;
     unsigned long i, j;
+    spinlock_t *new_bucket_lock;
 
+
+    struct rcuhashbash_table *temp_table, *old_table;
+
+
+    temp_table =
+        kzalloc(sizeof(*table) + len2 * sizeof(table->buckets[0]), GFP_KERNEL);
+    temp_table->mask = mask2;
+    alloc_bucket_locks(temp_table, (1UL << new_buckets_shift));
+    rcu_assign_pointer(future_tbl, temp_table);
     if (mask2 < table->mask) {
         /* Shrink. */
-        const struct rcuhashbash_table *new_table;
         for (i = 0; i <= mask2; i++) {
-            struct hlist_node **last_next = &table->buckets[i].first;
+            struct rcuhashbash_entry *entry, *entry_prev;
+            struct hlist_node *node __attribute__((unused));
+            entry = hlist_entry(table->buckets[i].first,
+                                struct rcuhashbash_entry, node);
+            new_bucket_lock = bucket_lock(future_tbl, i);
+            if (!new_bucket_lock)
+                break;
+            spin_lock(new_bucket_lock);
+            temp_table->buckets[i].first = &entry->node;
+            entry->node.pprev = &temp_table->buckets[i].first;
+            spin_unlock(new_bucket_lock);
             for (j = i + len2; j <= table->mask; j += len2) {
                 if (hlist_empty(&table->buckets[j]))
                     continue;
-                last_next = hlist_advance_last_next(last_next);
-                *last_next = table->buckets[j].first;
-                (*last_next)->pprev = last_next;
+                hlist_for_each_entry (entry, &temp_table->buckets[i], node)
+                    entry_prev = entry;
+
+                entry = hlist_entry(table->buckets[j].first,
+                                    struct rcuhashbash_entry, node);
+                new_bucket_lock = bucket_lock(future_tbl, i);
+                spin_lock(new_bucket_lock);
+                entry_prev->node.next = &entry->node;
+                if (!entry) {
+                    entry_prev->node.next = NULL;
+                    spin_unlock(new_bucket_lock);
+                    continue;
+                }
+                entry->node.pprev = &entry_prev->node.next;
+                spin_unlock(new_bucket_lock);
             }
         }
-        /* Force the readers to see the new links before the
-         * new mask. smp_wmb() does not suffice since the
-         * readers do not smp_rmb(). */
+        old_table = table;
+        rcu_assign_pointer(table, temp_table);
         synchronize_rcu();
-        table->mask = mask2;
-        synchronize_rcu();
-        /* Assume (and assert) that __krealloc shrinks in place. */
-        new_table =
-            krealloc(table, sizeof(*table) + len2 * sizeof(table->buckets[0]),
-                     GFP_KERNEL);
-        BUG_ON(new_table != table);
+        kfree(old_table->locks);
+        kfree(old_table);
     } else if (mask2 > table->mask) {
         /* Grow. */
-        struct rcuhashbash_table *temp_table, *old_table;
         bool moved_one;
-
-        /* Explicitly avoid in-place growth, to simplify the algorithm. */
-        temp_table = kzalloc(sizeof(*table) + len2 * sizeof(table->buckets[0]),
-                             GFP_KERNEL);
-        temp_table->mask = mask2;
         for (i = 0; i <= mask2; i++) {
             struct rcuhashbash_entry *entry;
             struct hlist_node *node __attribute__((unused));
             hlist_for_each_entry (entry, &table->buckets[i & table->mask], node)
                 if ((entry->value & mask2) == i) {
+                    new_bucket_lock = bucket_lock(
+                        future_tbl, (entry->value & future_tbl->mask));
+                    spin_lock(new_bucket_lock);
                     temp_table->buckets[i].first = &entry->node;
                     entry->node.pprev = &temp_table->buckets[i].first;
+                    spin_unlock(new_bucket_lock);
                     break;
                 }
         }
+
         /* We now have a valid hash table, albeit with buckets zipped together.
          */
         old_table = table;
@@ -252,16 +314,25 @@ static int rcuhashbash_resize(u8 new_buckets_shift, struct stats *stats)
                 hlist_for_each_entry (entry, &old_table->buckets[i], node)
                     if ((entry->value & mask2) == (entry_prev->value & mask2))
                         break;
+                new_bucket_lock = bucket_lock(
+                    future_tbl, (entry_prev->value & future_tbl->mask));
+                if (!new_bucket_lock) {
+                    break;
+                }
+                spin_lock(new_bucket_lock);
                 entry_prev->node.next = &entry->node;
                 if (!entry) {
                     entry_prev->node.next = NULL;
+                    spin_unlock(new_bucket_lock);
                     continue;
                 }
                 entry->node.pprev = &entry_prev->node.next;
+                spin_unlock(new_bucket_lock);
             }
             synchronize_rcu();
         } while (moved_one);
-
+        if (old_table)
+            kfree(old_table->locks);
         kfree(old_table);
     }
 
@@ -440,10 +511,8 @@ static int rcuhashbash_resize_thread(void *arg)
 
     do {
         cond_resched();
-        mutex_lock(&table_mutex);
         err = ops->resize(table->mask == (1UL << shift1) - 1 ? shift2 : shift1,
                           &stats);
-        mutex_unlock(&table_mutex);
     } while (!kthread_should_stop() && !err);
 
     *stats_ret = stats;
@@ -464,9 +533,7 @@ static int rcuhashbash_insert_thread(void *arg)
 
     do {
         cond_resched();
-        mutex_lock(&table_mutex);
         err = ops->insert((entries + i), &stats);
-        mutex_unlock(&table_mutex);
         if (!rcuhashbash_verify_insert(entries + i))
             printk(KERN_ALERT "insert failure\n");
         i++;
@@ -574,6 +641,7 @@ static void rcuhashbash_exit(void)
                 kmem_cache_free(entry_cache, entry);
             }
         }
+        kfree(table->locks);
         kfree(table);
     }
 
@@ -626,6 +694,12 @@ static __init int rcuhashbash_init(void)
         goto enomem;
 
     table->mask = (1UL << shift1) - 1;
+
+    if (alloc_bucket_locks(table, (1UL << shift1)) < 0) {
+        goto enomem;
+    }
+
+    future_tbl = table;
 
     for (i = 0; i < entries; i++) {
         struct rcuhashbash_entry *entry;
