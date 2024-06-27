@@ -35,8 +35,12 @@ MODULE_PARM_DESC(test, "Hash table implementation");
 module_param(readers, int, 0444);
 MODULE_PARM_DESC(readers,
                  "Number of reader threads (default: number of online CPUs)");
+module_param(insertct, int, 0444);
+MODULE_PARM_DESC(insertct, "Number of insert counts (default: 0)");
 module_param(resize, bool, 0444);
 MODULE_PARM_DESC(resize, "Whether to run a resize thread (default: true)");
+module_param(insert, bool, 0444);
+MODULE_PARM_DESC(insert, "Whether to run a insert thread (default: false)");
 module_param(shift1, byte, 0444);
 MODULE_PARM_DESC(shift1, "Initial number of hash buckets, log 2");
 module_param(shift2, byte, 0444);
