@@ -1,6 +1,7 @@
 #!/bin/bash
-TARGET_MODULE=rcuhashbash-resize
+TARGET_MODULE=rcuhashbash-resize_wob_lock
 sleep_time=10
+insert=false
 tests=("rcu" "ddds" "rwlock")
 readers=(1 2 4 8 16)
 
@@ -17,7 +18,12 @@ do
     sudo rmmod ${TARGET_MODULE}
 done
 
-sudo dmesg | grep "rcuhashbash summary" | grep -oP "reads: \K\d+(?= primary hits)" > 8k_buckets_without_resizing_rcu.txt
+mapfile -t reads < <(sudo dmesg | grep "rcuhashbash summary" | grep -oP "reads: \K\d+(?= primary hits)")
+
+for i in "${!reads[@]}"; do
+    echo "${readers[i]} ${reads[i]}"
+done > 8k_buckets_without_resizing_rcu.txt
+
 
 sudo dmesg -C
 
@@ -31,7 +37,12 @@ do
     sleep ${sleep_time}
     sudo rmmod ${TARGET_MODULE}
 done
-sudo dmesg | grep "rcuhashbash summary" | grep -oP "reads: \K\d+(?= primary hits)" > 8k_buckets_without_resizing_ddds.txt
+
+mapfile -t reads < <(sudo dmesg | grep "rcuhashbash summary" | grep -oP "reads: \K\d+(?= primary hits)")
+
+for i in "${!reads[@]}"; do
+    echo "${readers[i]} ${reads[i]}"
+done > 8k_buckets_without_resizing_ddds.txt
 
 sudo dmesg -C
 
@@ -45,4 +56,11 @@ do
     sleep ${sleep_time}
     sudo rmmod ${TARGET_MODULE}
 done
-sudo dmesg | grep "rcuhashbash summary" | grep -oP "reads: \K\d+(?= primary hits)" > 8k_buckets_without_resizing_rwlock.txt
+
+mapfile -t reads < <(sudo dmesg | grep "rcuhashbash summary" | grep -oP "reads: \K\d+(?= primary hits)")
+
+for i in "${!reads[@]}"; do
+    echo "${readers[i]} ${reads[i]}"
+done > 8k_buckets_without_resizing_rwlock.txt
+
+gnuplot script_resize.gp 

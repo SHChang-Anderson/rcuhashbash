@@ -1,6 +1,6 @@
 set title "8k buckets without resizing"
 set xlabel "Reader threads"
-set ylabel "Lookups/second"
+set ylabel "Lookups"
 set terminal png font "Times_New_Roman, 12"
 set key right
 
