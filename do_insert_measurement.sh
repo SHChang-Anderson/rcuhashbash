@@ -41,4 +41,4 @@ for i in "${!inserts[@]}"; do
     echo "${sleep_time[i]} ${inserts[i]}"
 done > output_table_mutex.txt
 
-gnuplot script.gp
+gnuplot script_insert.gp
