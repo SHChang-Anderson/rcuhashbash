@@ -5,6 +5,7 @@
  * ddds implementation based on work by Nick Piggin.
  */
 #include <asm/byteorder.h>
+#include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/kthread.h>
 #include <linux/list.h>
@@ -541,7 +542,8 @@ static int rcuhashbash_insert_thread(void *arg)
         if (!rcuhashbash_verify_insert(entries + i))
             printk(KERN_ALERT "insert failure\n");
         i++;
-    } while (!kthread_should_stop() && !err && i < insertct);
+        msleep(10);
+    } while (!kthread_should_stop() && !err);
 
     *stats_ret = stats;
 
